@@ -1,28 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Buscador de Arquivos por CNPJ
-==============================
-
-O que esse programa faz:
-1. Você escolhe uma planilha Excel com as colunas TOMADOR e CNPJ.
-2. Você escolhe a pasta "raiz" onde o programa vai procurar (a pasta que tem
-   uma subpasta para cada CNPJ).
-3. Você escolhe a pasta de destino, onde os arquivos encontrados vão ser
-   copiados.
-4. O programa limpa o CNPJ (tira ponto, traço e barra), entra na pasta raiz,
-   procura uma pasta com esse número (em qualquer nível, não precisa ser
-   direto na raiz), e dentro dela procura um arquivo cujo nome contenha
-   "CNPJ_FOLHA".
-5. Quando encontra, copia esse arquivo para a pasta de destino, renomeado
-   com o número do TOMADOR (mantendo a extensão original, ex: 1212.pdf).
-6. Tomadores cujo CNPJ não foi encontrado em nenhuma pasta são listados em um
-   arquivo "nao_encontrados.txt" na pasta de destino.
-7. Se o mesmo CNPJ aparecer em mais de uma pasta, o programa usa a primeira
-   que encontrar e anota o caso em "duplicados.txt" na pasta de destino,
-   para você conferir manualmente depois.
-
-Como gerar o .exe (opcional, ver instruções no final deste arquivo ou no
-arquivo LEIA-ME.txt que acompanha o programa).
+Buscador de Arquivos — CNPJ/Folha e Holerites
+===============================================
+Programa com duas abas:
+  Aba 1 - Busca de Folhas por CNPJ (lógica original)
+  Aba 2 - Busca de Holerites por Posto (lógica nova)
 """
 
 import os
@@ -41,404 +23,486 @@ except ImportError:
     openpyxl = None
 
 
-# ----------------------------------------------------------------------
-# Funções auxiliares (lógica pura, sem interface) - testáveis isoladamente
-# ----------------------------------------------------------------------
+# ======================================================================
+# UTILITÁRIOS COMUNS
+# ======================================================================
+
+def _exigir_openpyxl():
+    if openpyxl is None:
+        raise RuntimeError(
+            "A biblioteca 'openpyxl' não está instalada.\n"
+            "Abra o Prompt de Comando e rode: pip install openpyxl"
+        )
+
+def _salvar_txt(caminho, titulo, linhas_texto):
+    """Salva um arquivo .txt com cabeçalho de data/hora."""
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(f"{titulo} — gerado em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n\n")
+        for linha in linhas_texto:
+            f.write(linha + "\n")
+
+
+# ======================================================================
+# ABA 1 — BUSCA DE FOLHAS POR CNPJ
+# ======================================================================
 
 def limpar_documento(valor):
-    """Remove tudo que não for dígito de um CNPJ/CPF (pontos, traços, barras, espaços)."""
+    """Remove tudo que não for dígito de um CNPJ/CPF."""
     if valor is None:
         return ""
     return re.sub(r"\D", "", str(valor))
 
 
-def ler_planilha(caminho_excel):
-    """
-    Lê a planilha e retorna uma lista de tuplas (tomador, cnpj_limpo, cnpj_original).
-    Procura as colunas pelo nome (TOMADOR e CNPJ), sem diferenciar maiúsculas/
-    minúsculas e ignorando espaços nas bordas. Lança ValueError se não achar
-    as colunas.
-    """
-    if openpyxl is None:
-        raise RuntimeError(
-            "A biblioteca 'openpyxl' não está instalada. "
-            "Abra o Prompt de Comando e rode: pip install openpyxl"
-        )
-
+def ler_planilha_cnpj(caminho_excel):
+    """Lê planilha com colunas TOMADOR e CNPJ."""
+    _exigir_openpyxl()
     wb = openpyxl.load_workbook(caminho_excel, data_only=True)
     sheet = wb.active
-
     linhas = list(sheet.iter_rows(values_only=True))
     if not linhas:
         raise ValueError("A planilha está vazia.")
 
-    cabecalho = [str(c).strip().upper() if c is not None else "" for c in linhas[0]]
-
+    cab = [str(c).strip().upper() if c is not None else "" for c in linhas[0]]
     try:
-        idx_tomador = cabecalho.index("TOMADOR")
+        idx_t = cab.index("TOMADOR")
     except ValueError:
-        raise ValueError("Não encontrei a coluna 'TOMADOR' na primeira linha da planilha.")
-
+        raise ValueError("Coluna 'TOMADOR' não encontrada na planilha.")
     try:
-        idx_cnpj = cabecalho.index("CNPJ")
+        idx_c = cab.index("CNPJ")
     except ValueError:
-        raise ValueError("Não encontrei a coluna 'CNPJ' na primeira linha da planilha.")
+        raise ValueError("Coluna 'CNPJ' não encontrada na planilha.")
 
     resultado = []
     for linha in linhas[1:]:
-        if linha is None:
+        if not linha or (linha[idx_t] is None and linha[idx_c] is None):
             continue
-        if idx_tomador >= len(linha) or idx_cnpj >= len(linha):
-            continue
-
-        tomador_bruto = linha[idx_tomador]
-        cnpj_bruto = linha[idx_cnpj]
-
-        if tomador_bruto is None and cnpj_bruto is None:
-            continue
-
-        tomador = str(tomador_bruto).strip() if tomador_bruto is not None else ""
-        cnpj_original = str(cnpj_bruto).strip() if cnpj_bruto is not None else ""
-        cnpj_limpo = limpar_documento(cnpj_bruto)
-
+        tomador = str(linha[idx_t]).strip() if linha[idx_t] is not None else ""
+        cnpj_orig = str(linha[idx_c]).strip() if linha[idx_c] is not None else ""
+        cnpj_limpo = limpar_documento(linha[idx_c])
         if not tomador and not cnpj_limpo:
             continue
-
-        resultado.append((tomador, cnpj_limpo, cnpj_original))
-
+        resultado.append((tomador, cnpj_limpo, cnpj_orig))
     return resultado
 
 
 def encontrar_pastas_do_cnpj(pasta_raiz, cnpj_limpo):
-    """
-    Procura, em qualquer nível dentro de pasta_raiz, pastas cujo nome
-    (limpo de pontuação) seja igual ao cnpj_limpo. Retorna uma lista de
-    caminhos "de topo" (ignora uma pasta-com-o-cnpj que esteja DENTRO de
-    outra pasta-com-o-mesmo-cnpj já encontrada, já que isso é só uma pasta
-    aninhada repetindo o número, não uma duplicidade real em locais
-    diferentes).
-    """
-    todos_encontrados = []
-    for atual, subpastas, _arquivos in os.walk(pasta_raiz):
-        for nome_pasta in subpastas:
-            if limpar_documento(nome_pasta) == cnpj_limpo:
-                todos_encontrados.append(os.path.join(atual, nome_pasta))
-
-    # Remove caminhos que estão dentro de outro caminho já encontrado
-    todos_encontrados.sort(key=len)
+    todos = []
+    for atual, subpastas, _ in os.walk(pasta_raiz):
+        for nome in subpastas:
+            if limpar_documento(nome) == cnpj_limpo:
+                todos.append(os.path.join(atual, nome))
+    todos.sort(key=len)
     de_topo = []
-    for caminho in todos_encontrados:
-        caminho_norm = os.path.normpath(caminho)
-        dentro_de_outro = any(
-            caminho_norm.startswith(os.path.normpath(pai) + os.sep)
-            for pai in de_topo
-        )
-        if not dentro_de_outro:
-            de_topo.append(caminho)
-
+    for c in todos:
+        cn = os.path.normpath(c)
+        if not any(cn.startswith(os.path.normpath(p) + os.sep) for p in de_topo):
+            de_topo.append(c)
     return de_topo
 
 
 def encontrar_subpasta_repetida(pasta_cnpj, cnpj_limpo):
-    """
-    Procura, dentro de pasta_cnpj (em qualquer nível), uma subpasta cujo
-    nome limpo seja igual ao cnpj_limpo - ou seja, a pasta "repetida" que
-    normalmente existe dentro da pasta do CNPJ. Retorna o caminho dessa
-    subpasta mais rasa encontrada, ou None se não existir nenhuma.
-    """
     candidatas = []
-    for atual, subpastas, _arquivos in os.walk(pasta_cnpj):
-        for nome_pasta in subpastas:
-            if limpar_documento(nome_pasta) == cnpj_limpo:
-                candidatas.append(os.path.join(atual, nome_pasta))
+    for atual, subpastas, _ in os.walk(pasta_cnpj):
+        for nome in subpastas:
+            if limpar_documento(nome) == cnpj_limpo:
+                candidatas.append(os.path.join(atual, nome))
     if not candidatas:
         return None
-    # Pega a mais rasa (caminho mais curto), que é a primeira repetição
     candidatas.sort(key=len)
     return candidatas[0]
 
 
-def encontrar_arquivo_cnpj_folha(pasta_cnpj, cnpj_limpo, log_callback=None):
-    """
-    Procura o arquivo de folha seguindo a regra:
-    - Sempre existe, dentro da pasta do CNPJ, uma subpasta repetida com o
-      mesmo nome/número. A busca pelo arquivo deve acontecer SÓ dentro
-      dessa subpasta, ignorando qualquer arquivo solto fora dela (que pode
-      ser um PDF de outro assunto).
-    - Caso, excepcionalmente, essa subpasta não exista, cai para uma busca
-      em toda a pasta do CNPJ como rede de segurança (e avisa no log).
-    O nome do arquivo precisa conter "FOLHA" (sem diferenciar maiúsculas/
-    minúsculas); o restante do nome (número do CNPJ, datas, etc.) pode
-    variar livremente.
-    Retorna o caminho completo do arquivo encontrado, ou None.
-    """
+def encontrar_arquivo_folha(pasta_cnpj, cnpj_limpo, log_callback=None):
     alvo = "folha"
     subpasta = encontrar_subpasta_repetida(pasta_cnpj, cnpj_limpo)
-
     if subpasta:
-        for atual, _subpastas, arquivos in os.walk(subpasta):
-            for nome_arquivo in arquivos:
-                nome_sem_ext, _ext = os.path.splitext(nome_arquivo)
-                if alvo in nome_sem_ext.lower():
-                    return os.path.join(atual, nome_arquivo)
-        # Subpasta existe mas não tem o arquivo dentro - não procura fora dela
+        for atual, _, arquivos in os.walk(subpasta):
+            for nome in arquivos:
+                if alvo in os.path.splitext(nome)[0].lower():
+                    return os.path.join(atual, nome)
         return None
-
-    # Sem subpasta repetida: busca de segurança em toda a pasta do CNPJ
     if log_callback:
-        log_callback(f"    Aviso: não encontrei a subpasta repetida dentro de "
-                     f"'{pasta_cnpj}'. Procurando em toda a pasta como alternativa.")
-    for atual, _subpastas, arquivos in os.walk(pasta_cnpj):
-        for nome_arquivo in arquivos:
-            nome_sem_ext, _ext = os.path.splitext(nome_arquivo)
-            if alvo in nome_sem_ext.lower():
-                return os.path.join(atual, nome_arquivo)
+        log_callback(f"    Aviso: subpasta repetida não encontrada em '{pasta_cnpj}'. "
+                     f"Procurando em toda a pasta.")
+    for atual, _, arquivos in os.walk(pasta_cnpj):
+        for nome in arquivos:
+            if alvo in os.path.splitext(nome)[0].lower():
+                return os.path.join(atual, nome)
     return None
 
 
-def processar(caminho_excel, pasta_busca, pasta_destino, log_callback, progresso_callback):
-    """
-    Executa o processo completo. log_callback(str) é chamado para cada linha
-    de log. progresso_callback(atual, total) é chamado a cada item processado.
-    Retorna um dicionário com estatísticas finais.
-    """
+def processar_cnpj(caminho_excel, pasta_busca, pasta_destino, log_callback, progresso_callback):
     os.makedirs(pasta_destino, exist_ok=True)
-
     log_callback("Lendo planilha...")
-    linhas = ler_planilha(caminho_excel)
+    linhas = ler_planilha_cnpj(caminho_excel)
     total = len(linhas)
-    log_callback(f"{total} linha(s) encontrada(s) na planilha.\n")
+    log_callback(f"{total} linha(s) encontrada(s).\n")
 
     try:
-        itens_raiz = sorted(os.listdir(pasta_busca))
-        pastas_raiz = [n for n in itens_raiz if os.path.isdir(os.path.join(pasta_busca, n))]
+        pastas_raiz = [n for n in sorted(os.listdir(pasta_busca))
+                       if os.path.isdir(os.path.join(pasta_busca, n))]
         log_callback(f"Pasta de busca: {pasta_busca}")
-        log_callback(f"Pastas encontradas direto na raiz ({len(pastas_raiz)}): "
+        log_callback(f"Subpastas na raiz ({len(pastas_raiz)}): "
                      f"{', '.join(pastas_raiz[:30])}"
-                     f"{' ...' if len(pastas_raiz) > 30 else ''}\n")
+                     f"{'...' if len(pastas_raiz) > 30 else ''}\n")
     except Exception as e:
-        log_callback(f"Aviso: não consegui listar a pasta de busca para diagnóstico ({e}).\n")
+        log_callback(f"Aviso: não foi possível listar a pasta de busca ({e}).\n")
 
-    nao_encontrados = []
-    duplicados = []
+    nao_encontrados, duplicados, erros = [], [], []
     copiados = 0
-    erros = []
 
-    for i, (tomador, cnpj_limpo, cnpj_original) in enumerate(linhas, start=1):
+    for i, (tomador, cnpj_limpo, cnpj_orig) in enumerate(linhas, 1):
         progresso_callback(i, total)
-
         if not cnpj_limpo:
-            log_callback(f"[{i}/{total}] Tomador '{tomador}': CNPJ vazio/ inválido na planilha. Pulando.")
-            nao_encontrados.append((tomador, cnpj_original or "(vazio)"))
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': CNPJ vazio. Pulando.")
+            nao_encontrados.append(f"TOMADOR: {tomador}\tCNPJ: {cnpj_orig or '(vazio)'}")
             continue
 
-        log_callback(f"[{i}/{total}] Procurando CNPJ original '{cnpj_original}' -> limpo '{cnpj_limpo}'...")
-
+        log_callback(f"[{i}/{total}] Procurando CNPJ '{cnpj_orig}' -> '{cnpj_limpo}'...")
         pastas = encontrar_pastas_do_cnpj(pasta_busca, cnpj_limpo)
 
         if not pastas:
-            log_callback(f"[{i}/{total}] Tomador '{tomador}' (CNPJ {cnpj_original}): "
-                         f"pasta não encontrada.")
-            nao_encontrados.append((tomador, cnpj_original))
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': pasta não encontrada.")
+            nao_encontrados.append(f"TOMADOR: {tomador}\tCNPJ: {cnpj_orig}")
             continue
 
         if len(pastas) > 1:
-            log_callback(f"[{i}/{total}] Tomador '{tomador}' (CNPJ {cnpj_original}): "
-                         f"ATENÇÃO - {len(pastas)} pastas com esse CNPJ encontradas. "
-                         f"Usando a primeira.")
-            duplicados.append((tomador, cnpj_original, pastas))
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': {len(pastas)} pastas encontradas, usando a primeira.")
+            duplicados.append(f"TOMADOR: {tomador}\tCNPJ: {cnpj_orig}\n"
+                              + "\n".join(f"    - {p}" for p in pastas))
 
-        pasta_escolhida = pastas[0]
-        arquivo_origem = encontrar_arquivo_cnpj_folha(pasta_escolhida, cnpj_limpo, log_callback)
-
-        if not arquivo_origem:
-            log_callback(f"[{i}/{total}] Tomador '{tomador}' (CNPJ {cnpj_original}): "
-                         f"pasta encontrada, mas nenhum arquivo 'CNPJ_FOLHA' dentro dela.")
-            nao_encontrados.append((tomador, cnpj_original))
+        arquivo_orig = encontrar_arquivo_folha(pastas[0], cnpj_limpo, log_callback)
+        if not arquivo_orig:
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': pasta encontrada mas sem arquivo 'FOLHA'.")
+            nao_encontrados.append(f"TOMADOR: {tomador}\tCNPJ: {cnpj_orig}")
             continue
 
-        _nome_sem_ext, ext = os.path.splitext(arquivo_origem)
-        nome_tomador_seguro = re.sub(r'[\\/:*?"<>|]', "_", str(tomador)) or "SEM_TOMADOR"
-        nome_destino = f"{nome_tomador_seguro}{ext}"
-        caminho_destino = os.path.join(pasta_destino, nome_destino)
-
-        # Evita sobrescrever silenciosamente se já existir um tomador com mesmo nome
-        if os.path.exists(caminho_destino):
-            base, ext2 = os.path.splitext(nome_destino)
-            contador = 2
-            while os.path.exists(caminho_destino):
-                caminho_destino = os.path.join(pasta_destino, f"{base}_{contador}{ext2}")
-                contador += 1
+        _, ext = os.path.splitext(arquivo_orig)
+        nome_seg = re.sub(r'[\\/:*?"<>|]', "_", str(tomador)) or "SEM_TOMADOR"
+        destino_final = os.path.join(pasta_destino, f"{nome_seg}{ext}")
+        if os.path.exists(destino_final):
+            base, e2 = os.path.splitext(f"{nome_seg}{ext}")
+            k = 2
+            while os.path.exists(destino_final):
+                destino_final = os.path.join(pasta_destino, f"{base}_{k}{e2}")
+                k += 1
 
         try:
-            shutil.copy2(arquivo_origem, caminho_destino)
+            shutil.copy2(arquivo_orig, destino_final)
             copiados += 1
-            log_callback(f"[{i}/{total}] Tomador '{tomador}' (CNPJ {cnpj_original}): "
-                         f"OK -> {os.path.basename(caminho_destino)}")
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': OK -> {os.path.basename(destino_final)}")
         except Exception as e:
-            erros.append((tomador, cnpj_original, str(e)))
-            log_callback(f"[{i}/{total}] Tomador '{tomador}' (CNPJ {cnpj_original}): "
-                         f"ERRO ao copiar - {e}")
+            erros.append(f"TOMADOR: {tomador}\tCNPJ: {cnpj_orig}\tERRO: {e}")
+            log_callback(f"[{i}/{total}] Tomador '{tomador}': ERRO ao copiar — {e}")
 
-    # Grava arquivo de não encontrados
     if nao_encontrados:
-        caminho_txt = os.path.join(pasta_destino, "nao_encontrados.txt")
-        with open(caminho_txt, "w", encoding="utf-8") as f:
-            f.write(f"Tomadores/CNPJs não encontrados - gerado em "
-                    f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-            f.write("=" * 60 + "\n\n")
-            for tomador, cnpj in nao_encontrados:
-                f.write(f"TOMADOR: {tomador}\tCNPJ: {cnpj}\n")
-        log_callback(f"\nArquivo 'nao_encontrados.txt' gerado com {len(nao_encontrados)} item(ns).")
-
-    # Grava arquivo de duplicados, se houver
+        p = os.path.join(pasta_destino, "nao_encontrados.txt")
+        _salvar_txt(p, "Tomadores/CNPJs não encontrados", nao_encontrados)
+        log_callback(f"\n'nao_encontrados.txt' gerado com {len(nao_encontrados)} item(ns).")
     if duplicados:
-        caminho_txt = os.path.join(pasta_destino, "duplicados.txt")
-        with open(caminho_txt, "w", encoding="utf-8") as f:
-            f.write(f"CNPJs com mais de uma pasta encontrada - gerado em "
-                    f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-            f.write("Foi usada sempre a PRIMEIRA pasta da lista abaixo. Confira manualmente.\n")
-            f.write("=" * 60 + "\n\n")
-            for tomador, cnpj, pastas in duplicados:
-                f.write(f"TOMADOR: {tomador}\tCNPJ: {cnpj}\n")
-                for p in pastas:
-                    f.write(f"    - {p}\n")
-                f.write("\n")
-        log_callback(f"Arquivo 'duplicados.txt' gerado com {len(duplicados)} caso(s).")
-
-    # Grava arquivo de erros de cópia, se houver
+        p = os.path.join(pasta_destino, "duplicados.txt")
+        _salvar_txt(p, "CNPJs com mais de uma pasta (usada a primeira)", duplicados)
+        log_callback(f"'duplicados.txt' gerado com {len(duplicados)} caso(s).")
     if erros:
-        caminho_txt = os.path.join(pasta_destino, "erros_copia.txt")
-        with open(caminho_txt, "w", encoding="utf-8") as f:
-            f.write(f"Erros ao copiar arquivos - gerado em "
-                    f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-            f.write("=" * 60 + "\n\n")
-            for tomador, cnpj, erro in erros:
-                f.write(f"TOMADOR: {tomador}\tCNPJ: {cnpj}\tERRO: {erro}\n")
-        log_callback(f"Arquivo 'erros_copia.txt' gerado com {len(erros)} erro(s).")
+        p = os.path.join(pasta_destino, "erros_copia.txt")
+        _salvar_txt(p, "Erros ao copiar", erros)
+        log_callback(f"'erros_copia.txt' gerado com {len(erros)} erro(s).")
 
-    return {
-        "total": total,
-        "copiados": copiados,
-        "nao_encontrados": len(nao_encontrados),
-        "duplicados": len(duplicados),
-        "erros": len(erros),
-    }
+    return {"total": total, "copiados": copiados,
+            "nao_encontrados": len(nao_encontrados),
+            "duplicados": len(duplicados), "erros": len(erros)}
 
 
-# ----------------------------------------------------------------------
-# Interface gráfica
-# ----------------------------------------------------------------------
+# ======================================================================
+# ABA 2 — BUSCA DE HOLERITES POR POSTO
+# ======================================================================
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title("Buscador de Arquivos por CNPJ")
-        root.geometry("720x560")
-        root.minsize(680, 520)
+def ler_planilha_posto(caminho_excel):
+    """Lê planilha com coluna POSTO. Retorna lista de strings com o número do posto."""
+    _exigir_openpyxl()
+    wb = openpyxl.load_workbook(caminho_excel, data_only=True)
+    sheet = wb.active
+    linhas = list(sheet.iter_rows(values_only=True))
+    if not linhas:
+        raise ValueError("A planilha está vazia.")
 
-        self.caminho_excel = tk.StringVar()
-        self.pasta_busca = tk.StringVar()
-        self.pasta_destino = tk.StringVar()
+    cab = [str(c).strip().upper() if c is not None else "" for c in linhas[0]]
+    try:
+        idx_p = cab.index("TOMADOR")
+    except ValueError:
+        raise ValueError("Coluna 'TOMADOR' não encontrada na planilha.")
 
-        self._montar_interface()
+    resultado = []
+    for linha in linhas[1:]:
+        if not linha or linha[idx_p] is None:
+            continue
+        posto = str(linha[idx_p]).strip()
+        if posto:
+            resultado.append(posto)
+    return resultado
 
-    def _montar_interface(self):
-        pad = {"padx": 10, "pady": 6}
 
-        frame_topo = ttk.Frame(self.root)
-        frame_topo.pack(fill="x", **pad)
+def encontrar_pasta_do_posto(pasta_raiz, numero_posto):
+    """
+    Procura, em qualquer nível dentro de pasta_raiz, uma pasta cujo nome
+    contenha o número do posto. Retorna a lista de pastas encontradas.
+    Usa correspondência exata do número dentro do nome da pasta para evitar
+    falsos positivos (ex: posto '10' não deve bater com '100').
+    """
+    encontradas = []
+    for atual, subpastas, _ in os.walk(pasta_raiz):
+        for nome in subpastas:
+            # Verifica se o número do posto aparece como palavra/token isolado
+            # dentro do nome da pasta (ex: "POSTO 42", "42 - Nome", "042")
+            nome_norm = re.sub(r"\D+", " ", nome).strip()
+            tokens = nome_norm.split()
+            # Também compara removendo zeros à esquerda para cobrir "042" == "42"
+            if any(t == numero_posto or t.lstrip("0") == numero_posto.lstrip("0")
+                   for t in tokens):
+                encontradas.append(os.path.join(atual, nome))
+    # Filtra apenas os de topo (sem aninhamento)
+    encontradas.sort(key=len)
+    de_topo = []
+    for c in encontradas:
+        cn = os.path.normpath(c)
+        if not any(cn.startswith(os.path.normpath(p) + os.sep) for p in de_topo):
+            de_topo.append(c)
+    return de_topo
 
-        ttk.Label(
-            frame_topo,
-            text="Buscador de Arquivos por CNPJ",
-            font=("Segoe UI", 14, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
-            frame_topo,
-            text="Selecione a planilha e as pastas abaixo e clique em Iniciar.",
-        ).pack(anchor="w")
 
-        # --- Planilha Excel ---
-        frame1 = ttk.LabelFrame(self.root, text="1. Planilha Excel (colunas TOMADOR e CNPJ)")
-        frame1.pack(fill="x", **pad)
-        self._linha_selecao(frame1, self.caminho_excel, self._escolher_excel)
+def encontrar_holerites_do_posto(pasta_posto):
+    """
+    Dentro da pasta do posto (sem entrar em subpastas), procura arquivos
+    que contenham 'holerite' E ('seg' ou 'ser') no nome (sem diferenciar
+    maiúsculas/minúsculas).
+    Retorna dicionário: {'SEG': [caminhos], 'SER': [caminhos]}
+    """
+    resultado = {"SEG": [], "SER": []}
+    try:
+        arquivos = [f for f in os.listdir(pasta_posto)
+                    if os.path.isfile(os.path.join(pasta_posto, f))]
+    except Exception:
+        return resultado
 
-        # --- Pasta de busca ---
-        frame2 = ttk.LabelFrame(self.root, text="2. Pasta onde estão as pastas dos CNPJs")
-        frame2.pack(fill="x", **pad)
-        self._linha_selecao(frame2, self.pasta_busca, self._escolher_pasta_busca)
+    for nome in arquivos:
+        nome_lower = os.path.splitext(nome)[0].lower()
+        tem_holerite = "holerite" in nome_lower
+        tem_seg = "seg" in nome_lower
+        tem_ser = "ser" in nome_lower
+        if tem_holerite and tem_seg:
+            resultado["SEG"].append(os.path.join(pasta_posto, nome))
+        elif tem_holerite and tem_ser:
+            resultado["SER"].append(os.path.join(pasta_posto, nome))
+    return resultado
 
-        # --- Pasta de destino ---
-        frame3 = ttk.LabelFrame(self.root, text="3. Pasta de destino (onde os arquivos serão copiados)")
-        frame3.pack(fill="x", **pad)
-        self._linha_selecao(frame3, self.pasta_destino, self._escolher_pasta_destino)
 
-        # --- Botão iniciar + barra de progresso ---
-        frame_acao = ttk.Frame(self.root)
-        frame_acao.pack(fill="x", **pad)
+def processar_holerites(caminho_excel, pasta_busca, pasta_destino, log_callback, progresso_callback):
+    pasta_seg = os.path.join(pasta_destino, "Holerites SEG")
+    pasta_ser = os.path.join(pasta_destino, "Holerites SER")
+    os.makedirs(pasta_seg, exist_ok=True)
+    os.makedirs(pasta_ser, exist_ok=True)
 
+    log_callback("Lendo planilha de postos...")
+    postos = ler_planilha_posto(caminho_excel)
+    total = len(postos)
+    log_callback(f"{total} posto(s) encontrado(s).\n")
+
+    try:
+        pastas_raiz = [n for n in sorted(os.listdir(pasta_busca))
+                       if os.path.isdir(os.path.join(pasta_busca, n))]
+        log_callback(f"Pasta de busca: {pasta_busca}")
+        log_callback(f"Subpastas na raiz ({len(pastas_raiz)}): "
+                     f"{', '.join(pastas_raiz[:30])}"
+                     f"{'...' if len(pastas_raiz) > 30 else ''}\n")
+    except Exception as e:
+        log_callback(f"Aviso: não foi possível listar a pasta de busca ({e}).\n")
+
+    nao_encontrados, erros = [], []
+    copiados_seg = copiados_ser = 0
+
+    for i, posto in enumerate(postos, 1):
+        progresso_callback(i, total)
+        log_callback(f"[{i}/{total}] Posto '{posto}'...")
+
+        pastas = encontrar_pasta_do_posto(pasta_busca, posto)
+        if not pastas:
+            log_callback(f"[{i}/{total}] Posto '{posto}': pasta não encontrada.")
+            nao_encontrados.append(f"POSTO: {posto}")
+            continue
+
+        if len(pastas) > 1:
+            log_callback(f"[{i}/{total}] Posto '{posto}': {len(pastas)} pastas encontradas, usando a primeira.")
+
+        pasta_posto = pastas[0]
+        holerites = encontrar_holerites_do_posto(pasta_posto)
+
+        achou_algo = False
+        for tipo, arquivos in holerites.items():
+            pasta_tipo = pasta_seg if tipo == "SEG" else pasta_ser
+            for origem in arquivos:
+                nome_orig = os.path.basename(origem)
+                destino_final = os.path.join(pasta_tipo, nome_orig)
+                # Evita sobrescrita silenciosa
+                if os.path.exists(destino_final):
+                    base, ext = os.path.splitext(nome_orig)
+                    k = 2
+                    while os.path.exists(destino_final):
+                        destino_final = os.path.join(pasta_tipo, f"{base}_{k}{ext}")
+                        k += 1
+                try:
+                    shutil.copy2(origem, destino_final)
+                    if tipo == "SEG":
+                        copiados_seg += 1
+                    else:
+                        copiados_ser += 1
+                    achou_algo = True
+                    log_callback(f"    [{tipo}] {nome_orig} -> {os.path.basename(destino_final)}")
+                except Exception as e:
+                    erros.append(f"POSTO: {posto}\tARQUIVO: {nome_orig}\tERRO: {e}")
+                    log_callback(f"    [{tipo}] ERRO ao copiar '{nome_orig}': {e}")
+
+        if not achou_algo:
+            log_callback(f"[{i}/{total}] Posto '{posto}': pasta encontrada mas sem holerites SEG/SER.")
+            nao_encontrados.append(f"POSTO: {posto}\t(pasta encontrada, sem holerites SEG/SER)")
+
+    if nao_encontrados:
+        p = os.path.join(pasta_destino, "nao_encontrados_holerites.txt")
+        _salvar_txt(p, "Postos sem holerites encontrados", nao_encontrados)
+        log_callback(f"\n'nao_encontrados_holerites.txt' gerado com {len(nao_encontrados)} item(ns).")
+    if erros:
+        p = os.path.join(pasta_destino, "erros_copia_holerites.txt")
+        _salvar_txt(p, "Erros ao copiar holerites", erros)
+        log_callback(f"'erros_copia_holerites.txt' gerado com {len(erros)} erro(s).")
+
+    return {"total": total,
+            "copiados_seg": copiados_seg, "copiados_ser": copiados_ser,
+            "nao_encontrados": len(nao_encontrados), "erros": len(erros)}
+
+
+# ======================================================================
+# INTERFACE GRÁFICA — COMPONENTE DE ABA GENÉRICO
+# ======================================================================
+
+class AbaBase:
+    """Classe base com os widgets comuns às duas abas (seleção + log + progresso)."""
+
+    def __init__(self, notebook, titulo_aba):
+        self.frame = ttk.Frame(notebook)
+        notebook.add(self.frame, text=titulo_aba)
+        self._widgets_comuns()
+
+    def _widgets_comuns(self):
+        self._vars = {}
+        self._frames_selecao = ttk.Frame(self.frame)
+        self._frames_selecao.pack(fill="x", padx=10, pady=6)
+
+        frame_acao = ttk.Frame(self.frame)
+        frame_acao.pack(fill="x", padx=10, pady=4)
         self.botao_iniciar = ttk.Button(frame_acao, text="Iniciar", command=self._iniciar)
         self.botao_iniciar.pack(side="left")
-
-        self.barra_progresso = ttk.Progressbar(frame_acao, mode="determinate")
-        self.barra_progresso.pack(side="left", fill="x", expand=True, padx=10)
-
+        self.barra = ttk.Progressbar(frame_acao, mode="determinate")
+        self.barra.pack(side="left", fill="x", expand=True, padx=10)
         self.label_status = ttk.Label(frame_acao, text="")
         self.label_status.pack(side="left")
 
-        # --- Log ---
-        frame_log = ttk.LabelFrame(self.root, text="Andamento")
-        frame_log.pack(fill="both", expand=True, **pad)
-
-        self.texto_log = tk.Text(frame_log, wrap="word", state="disabled", height=15)
+        frame_log = ttk.LabelFrame(self.frame, text="Andamento")
+        frame_log.pack(fill="both", expand=True, padx=10, pady=6)
+        self.texto_log = tk.Text(frame_log, wrap="word", state="disabled")
         self.texto_log.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frame_log, command=self.texto_log.yview)
+        sb.pack(side="right", fill="y")
+        self.texto_log.configure(yscrollcommand=sb.set)
 
-        scrollbar = ttk.Scrollbar(frame_log, command=self.texto_log.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.texto_log.configure(yscrollcommand=scrollbar.set)
+    def _linha_selecao(self, parent, label, key, comando):
+        lf = ttk.LabelFrame(parent, text=label)
+        lf.pack(fill="x", pady=3)
+        var = tk.StringVar()
+        self._vars[key] = var
+        f = ttk.Frame(lf)
+        f.pack(fill="x", padx=8, pady=5)
+        ttk.Entry(f, textvariable=var).pack(side="left", fill="x", expand=True)
+        ttk.Button(f, text="Escolher...", command=comando).pack(side="left", padx=6)
 
-    def _linha_selecao(self, parent, variavel, comando):
-        frame = ttk.Frame(parent)
-        frame.pack(fill="x", padx=8, pady=6)
-        entrada = ttk.Entry(frame, textvariable=variavel)
-        entrada.pack(side="left", fill="x", expand=True)
-        ttk.Button(frame, text="Escolher...", command=comando).pack(side="left", padx=6)
+    def _escolher_arquivo(self, key, titulo):
+        p = filedialog.askopenfilename(
+            title=titulo,
+            filetypes=[("Excel", "*.xlsx *.xlsm"), ("Todos os arquivos", "*.*")])
+        if p:
+            self._vars[key].set(p)
 
-    def _escolher_excel(self):
-        caminho = filedialog.askopenfilename(
-            title="Selecione a planilha Excel",
-            filetypes=[("Excel", "*.xlsx *.xlsm"), ("Todos os arquivos", "*.*")],
-        )
-        if caminho:
-            self.caminho_excel.set(caminho)
+    def _escolher_pasta(self, key, titulo):
+        p = filedialog.askdirectory(title=titulo)
+        if p:
+            self._vars[key].set(p)
 
-    def _escolher_pasta_busca(self):
-        pasta = filedialog.askdirectory(title="Selecione a pasta onde estão as pastas dos CNPJs")
-        if pasta:
-            self.pasta_busca.set(pasta)
-
-    def _escolher_pasta_destino(self):
-        pasta = filedialog.askdirectory(title="Selecione a pasta de destino")
-        if pasta:
-            self.pasta_destino.set(pasta)
-
-    def _log(self, mensagem):
+    def _log(self, msg):
         self.texto_log.configure(state="normal")
-        self.texto_log.insert("end", mensagem + "\n")
+        self.texto_log.insert("end", msg + "\n")
         self.texto_log.see("end")
         self.texto_log.configure(state="disabled")
 
     def _progresso(self, atual, total):
-        self.barra_progresso["maximum"] = total
-        self.barra_progresso["value"] = atual
+        self.barra["maximum"] = total
+        self.barra["value"] = atual
         self.label_status.configure(text=f"{atual}/{total}")
 
     def _iniciar(self):
-        excel = self.caminho_excel.get().strip()
-        busca = self.pasta_busca.get().strip()
-        destino = self.pasta_destino.get().strip()
+        raise NotImplementedError
 
+    def _rodar_em_thread(self, fn, *args):
+        self.botao_iniciar.configure(state="disabled")
+        self.texto_log.configure(state="normal")
+        self.texto_log.delete("1.0", "end")
+        self.texto_log.configure(state="disabled")
+        self.barra["value"] = 0
+        root = self.frame.winfo_toplevel()
+
+        def _run():
+            try:
+                resultado = fn(
+                    *args,
+                    log_callback=lambda m: root.after(0, self._log, m),
+                    progresso_callback=lambda a, t: root.after(0, self._progresso, a, t),
+                )
+                root.after(0, self._finalizar_sucesso, resultado)
+            except Exception as e:
+                det = traceback.format_exc()
+                root.after(0, self._finalizar_erro, str(e), det)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finalizar_erro(self, msg, detalhe):
+        self.botao_iniciar.configure(state="normal")
+        self._log(f"\nERRO: {msg}")
+        messagebox.showerror("Erro", f"Ocorreu um erro:\n\n{msg}")
+        print(detalhe)
+
+    def _finalizar_sucesso(self, resultado):
+        raise NotImplementedError
+
+
+# ======================================================================
+# ABA 1 — INTERFACE
+# ======================================================================
+
+class AbaCNPJ(AbaBase):
+    def __init__(self, notebook):
+        super().__init__(notebook, "Folhas por CNPJ")
+        self._linha_selecao(self._frames_selecao,
+                            "1. Planilha Excel (colunas TOMADOR e CNPJ)",
+                            "excel", lambda: self._escolher_arquivo("excel", "Selecione a planilha Excel"))
+        self._linha_selecao(self._frames_selecao,
+                            "2. Pasta onde estão as pastas dos CNPJs",
+                            "busca", lambda: self._escolher_pasta("busca", "Selecione a pasta de busca"))
+        self._linha_selecao(self._frames_selecao,
+                            "3. Pasta de destino",
+                            "destino", lambda: self._escolher_pasta("destino", "Selecione a pasta de destino"))
+
+    def _iniciar(self):
+        excel = self._vars["excel"].get().strip()
+        busca = self._vars["busca"].get().strip()
+        destino = self._vars["destino"].get().strip()
         if not excel or not os.path.isfile(excel):
             messagebox.showerror("Erro", "Selecione um arquivo Excel válido.")
             return
@@ -448,67 +512,89 @@ class App:
         if not destino:
             messagebox.showerror("Erro", "Selecione a pasta de destino.")
             return
+        self._rodar_em_thread(processar_cnpj, excel, busca, destino)
 
-        self.botao_iniciar.configure(state="disabled")
-        self.texto_log.configure(state="normal")
-        self.texto_log.delete("1.0", "end")
-        self.texto_log.configure(state="disabled")
-        self.barra_progresso["value"] = 0
-
-        thread = threading.Thread(
-            target=self._executar_em_thread, args=(excel, busca, destino), daemon=True
-        )
-        thread.start()
-
-    def _executar_em_thread(self, excel, busca, destino):
-        try:
-            resultado = processar(
-                excel, busca, destino,
-                log_callback=lambda msg: self.root.after(0, self._log, msg),
-                progresso_callback=lambda a, t: self.root.after(0, self._progresso, a, t),
-            )
-            self.root.after(0, self._finalizar_sucesso, resultado, destino)
-        except Exception as e:
-            erro_completo = traceback.format_exc()
-            self.root.after(0, self._finalizar_erro, str(e), erro_completo)
-
-    def _finalizar_sucesso(self, resultado, destino):
+    def _finalizar_sucesso(self, r):
         self.botao_iniciar.configure(state="normal")
-        resumo = (
-            f"\nConcluído!\n"
-            f"Total de linhas: {resultado['total']}\n"
-            f"Copiados com sucesso: {resultado['copiados']}\n"
-            f"Não encontrados: {resultado['nao_encontrados']}\n"
-            f"Duplicados (verificar): {resultado['duplicados']}\n"
-            f"Erros de cópia: {resultado['erros']}\n"
-        )
-        self._log(resumo)
-        messagebox.showinfo(
-            "Concluído",
-            f"Processo finalizado.\n\n"
-            f"Copiados: {resultado['copiados']}\n"
-            f"Não encontrados: {resultado['nao_encontrados']}\n"
-            f"Duplicados: {resultado['duplicados']}\n"
-            f"Erros: {resultado['erros']}\n\n"
-            f"Veja os detalhes na pasta:\n{destino}",
-        )
+        self._log(f"\nConcluído!\nTotal: {r['total']} | Copiados: {r['copiados']} | "
+                  f"Não encontrados: {r['nao_encontrados']} | "
+                  f"Duplicados: {r['duplicados']} | Erros: {r['erros']}")
+        messagebox.showinfo("Concluído",
+                            f"Processo finalizado.\n\n"
+                            f"Copiados: {r['copiados']}\n"
+                            f"Não encontrados: {r['nao_encontrados']}\n"
+                            f"Duplicados: {r['duplicados']}\n"
+                            f"Erros: {r['erros']}")
 
-    def _finalizar_erro(self, mensagem, detalhe):
+
+# ======================================================================
+# ABA 2 — INTERFACE
+# ======================================================================
+
+class AbaHolerites(AbaBase):
+    def __init__(self, notebook):
+        super().__init__(notebook, "Holerites por Posto")
+        self._linha_selecao(self._frames_selecao,
+                            "1. Planilha Excel (mesma planilha com colunas TOMADOR e CNPJ)",
+                            "excel", lambda: self._escolher_arquivo("excel", "Selecione a planilha Excel"))
+        self._linha_selecao(self._frames_selecao,
+                            "2. Pasta onde estão as pastas dos Postos",
+                            "busca", lambda: self._escolher_pasta("busca", "Selecione a pasta de busca"))
+        self._linha_selecao(self._frames_selecao,
+                            "3. Pasta de destino (serão criadas 'Holerites SEG' e 'Holerites SER' aqui)",
+                            "destino", lambda: self._escolher_pasta("destino", "Selecione a pasta de destino"))
+
+    def _iniciar(self):
+        excel = self._vars["excel"].get().strip()
+        busca = self._vars["busca"].get().strip()
+        destino = self._vars["destino"].get().strip()
+        if not excel or not os.path.isfile(excel):
+            messagebox.showerror("Erro", "Selecione um arquivo Excel válido.")
+            return
+        if not busca or not os.path.isdir(busca):
+            messagebox.showerror("Erro", "Selecione uma pasta de busca válida.")
+            return
+        if not destino:
+            messagebox.showerror("Erro", "Selecione a pasta de destino.")
+            return
+        self._rodar_em_thread(processar_holerites, excel, busca, destino)
+
+    def _finalizar_sucesso(self, r):
         self.botao_iniciar.configure(state="normal")
-        self._log(f"\nERRO: {mensagem}")
-        messagebox.showerror("Erro", f"Ocorreu um erro:\n\n{mensagem}")
-        print(detalhe)
+        self._log(f"\nConcluído!\nTotal de postos: {r['total']} | "
+                  f"SEG copiados: {r['copiados_seg']} | SER copiados: {r['copiados_ser']} | "
+                  f"Não encontrados: {r['nao_encontrados']} | Erros: {r['erros']}")
+        messagebox.showinfo("Concluído",
+                            f"Processo finalizado.\n\n"
+                            f"Holerites SEG copiados: {r['copiados_seg']}\n"
+                            f"Holerites SER copiados: {r['copiados_ser']}\n"
+                            f"Postos não encontrados: {r['nao_encontrados']}\n"
+                            f"Erros: {r['erros']}")
 
+
+# ======================================================================
+# APLICAÇÃO PRINCIPAL
+# ======================================================================
 
 def main():
     root = tk.Tk()
+    root.title("Buscador de Arquivos")
+    root.geometry("760x600")
+    root.minsize(700, 540)
+
     try:
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
     except Exception:
         pass
-    App(root)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+    AbaCNPJ(notebook)
+    AbaHolerites(notebook)
+
     root.mainloop()
 
 
